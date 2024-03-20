@@ -1,0 +1,329 @@
+diff --git a/docker/Dockerfile b/docker/Dockerfile
+index 6c7c9ef..66a823d 100644
+--- a/docker/Dockerfile
++++ b/docker/Dockerfile
+@@ -53,7 +53,8 @@ RUN wget -q -P /tmp \
+ 
+ # Install conda packages.
+ ENV PATH="/opt/conda/bin:$PATH"
+-RUN conda install -qy conda==4.13.0 \
++ENV LD_LIBRARY_PATH="/opt/conda/lib:$LD_LIBRARY_PATH"
++RUN conda install -qy conda==24.1.2 \
+     && conda install -y -c conda-forge \
+       openmm=7.5.1 \
+       cudatoolkit==${CUDA_VERSION} \
+diff --git a/run_alphafold.py b/run_alphafold.py
+index 0d89bfb..38a4671 100644
+--- a/run_alphafold.py
++++ b/run_alphafold.py
+@@ -22,7 +22,8 @@ import random
+ import shutil
+ import sys
+ import time
+-from typing import Any, Dict, Mapping, Union
++import yaml
++from typing import Any, Dict, Mapping, Union, Optional
+ 
+ from absl import app
+ from absl import flags
+@@ -141,6 +142,18 @@ flags.DEFINE_boolean('use_gpu_relax', None, 'Whether to relax on GPU. '
+                      'Relax on GPU can be much faster than CPU, so it is '
+                      'recommended to enable if possible. GPUs must be available'
+                      ' if this setting is enabled.')
++flags.DEFINE_string('alphafold_config_yaml', None, 'Path to '
++                    'YAML file containing any changes to the default CONFIG or CONFIG_MULTIMER '
++                    'for running a monomer or multimer model, respectively. '
++                    'An example might be '
++                    'model:'
++                    '  num_recycle: 5'
++                    'For a list of parameters, see '
++                    'https://github.com/deepmind/alphafold/blob/v2.2.4/alphafold/model/config.py#L124'
++                    'and '
++                    'https://github.com/deepmind/alphafold/blob/v2.2.4/alphafold/model/config.py#L435')
++flags.DEFINE_boolean('only_msas', False, 'Whether to only build MSAs, and not '
++                     'do any prediction.')
+ 
+ FLAGS = flags.FLAGS
+ 
+@@ -180,7 +193,8 @@ def predict_structure(
+     amber_relaxer: relax.AmberRelaxation,
+     benchmark: bool,
+     random_seed: int,
+-    models_to_relax: ModelsToRelax):
++    models_to_relax: ModelsToRelax,
++    only_msas: Optional[bool] = False):
+   """Predicts structure using AlphaFold for the given sequence."""
+   logging.info('Predicting %s', fasta_name)
+   timings = {}
+@@ -203,130 +217,135 @@ def predict_structure(
+   with open(features_output_path, 'wb') as f:
+     pickle.dump(feature_dict, f, protocol=4)
+ 
+-  unrelaxed_pdbs = {}
+-  unrelaxed_proteins = {}
+-  relaxed_pdbs = {}
+-  relax_metrics = {}
+-  ranking_confidences = {}
+-
+-  # Run the models.
+-  num_models = len(model_runners)
+-  for model_index, (model_name, model_runner) in enumerate(
+-      model_runners.items()):
+-    logging.info('Running model %s on %s', model_name, fasta_name)
+-    t_0 = time.time()
+-    model_random_seed = model_index + random_seed * num_models
+-    processed_feature_dict = model_runner.process_features(
+-        feature_dict, random_seed=model_random_seed)
+-    timings[f'process_features_{model_name}'] = time.time() - t_0
+-
+-    t_0 = time.time()
+-    prediction_result = model_runner.predict(processed_feature_dict,
+-                                             random_seed=model_random_seed)
+-    t_diff = time.time() - t_0
+-    timings[f'predict_and_compile_{model_name}'] = t_diff
+-    logging.info(
+-        'Total JAX model %s on %s predict time (includes compilation time, see --benchmark): %.1fs',
+-        model_name, fasta_name, t_diff)
+-
+-    if benchmark:
+-      t_0 = time.time()
+-      model_runner.predict(processed_feature_dict,
+-                           random_seed=model_random_seed)
+-      t_diff = time.time() - t_0
+-      timings[f'predict_benchmark_{model_name}'] = t_diff
+-      logging.info(
+-          'Total JAX model %s on %s predict time (excludes compilation time): %.1fs',
+-          model_name, fasta_name, t_diff)
+-
+-    plddt = prediction_result['plddt']
+-    ranking_confidences[model_name] = prediction_result['ranking_confidence']
+-
+-    # Remove jax dependency from results.
+-    np_prediction_result = _jnp_to_np(dict(prediction_result))
+-
+-    # Save the model outputs.
+-    result_output_path = os.path.join(output_dir, f'result_{model_name}.pkl')
+-    with open(result_output_path, 'wb') as f:
+-      pickle.dump(np_prediction_result, f, protocol=4)
+-
+-    # Add the predicted LDDT in the b-factor column.
+-    # Note that higher predicted LDDT value means higher model confidence.
+-    plddt_b_factors = np.repeat(
+-        plddt[:, None], residue_constants.atom_type_num, axis=-1)
+-    unrelaxed_protein = protein.from_prediction(
+-        features=processed_feature_dict,
+-        result=prediction_result,
+-        b_factors=plddt_b_factors,
+-        remove_leading_feature_dimension=not model_runner.multimer_mode)
+-
+-    unrelaxed_proteins[model_name] = unrelaxed_protein
+-    unrelaxed_pdbs[model_name] = protein.to_pdb(unrelaxed_protein)
+-    unrelaxed_pdb_path = os.path.join(output_dir, f'unrelaxed_{model_name}.pdb')
+-    with open(unrelaxed_pdb_path, 'w') as f:
+-      f.write(unrelaxed_pdbs[model_name])
+-
+-  # Rank by model confidence.
+-  ranked_order = [
+-      model_name for model_name, confidence in
+-      sorted(ranking_confidences.items(), key=lambda x: x[1], reverse=True)]
+-
+-  # Relax predictions.
+-  if models_to_relax == ModelsToRelax.BEST:
+-    to_relax = [ranked_order[0]]
+-  elif models_to_relax == ModelsToRelax.ALL:
+-    to_relax = ranked_order
+-  elif models_to_relax == ModelsToRelax.NONE:
+-    to_relax = []
+-
+-  for model_name in to_relax:
+-    t_0 = time.time()
+-    relaxed_pdb_str, _, violations = amber_relaxer.process(
+-        prot=unrelaxed_proteins[model_name])
+-    relax_metrics[model_name] = {
+-        'remaining_violations': violations,
+-        'remaining_violations_count': sum(violations)
+-    }
+-    timings[f'relax_{model_name}'] = time.time() - t_0
+-
+-    relaxed_pdbs[model_name] = relaxed_pdb_str
+-
+-    # Save the relaxed PDB.
+-    relaxed_output_path = os.path.join(
+-        output_dir, f'relaxed_{model_name}.pdb')
+-    with open(relaxed_output_path, 'w') as f:
+-      f.write(relaxed_pdb_str)
+-
+-  # Write out relaxed PDBs in rank order.
+-  for idx, model_name in enumerate(ranked_order):
+-    ranked_output_path = os.path.join(output_dir, f'ranked_{idx}.pdb')
+-    with open(ranked_output_path, 'w') as f:
+-      if model_name in relaxed_pdbs:
+-        f.write(relaxed_pdbs[model_name])
+-      else:
+-        f.write(unrelaxed_pdbs[model_name])
+-
+-  ranking_output_path = os.path.join(output_dir, 'ranking_debug.json')
+-  with open(ranking_output_path, 'w') as f:
+-    label = 'iptm+ptm' if 'iptm' in prediction_result else 'plddts'
+-    f.write(json.dumps(
+-        {label: ranking_confidences, 'order': ranked_order}, indent=4))
++  if not only_msas:
++      unrelaxed_pdbs = {}
++      unrelaxed_proteins = {}
++      relaxed_pdbs = {}
++      relax_metrics = {}
++      ranking_confidences = {}
++
++      # Run the models.
++      num_models = len(model_runners)
++      for model_index, (model_name, model_runner) in enumerate(
++          model_runners.items()):
++        logging.info('Running model %s on %s', model_name, fasta_name)
++        t_0 = time.time()
++        model_random_seed = model_index + random_seed * num_models
++        processed_feature_dict = model_runner.process_features(
++            feature_dict, random_seed=model_random_seed)
++        timings[f'process_features_{model_name}'] = time.time() - t_0
++
++        t_0 = time.time()
++        prediction_result = model_runner.predict(processed_feature_dict,
++                                                 random_seed=model_random_seed)
++        t_diff = time.time() - t_0
++        timings[f'predict_and_compile_{model_name}'] = t_diff
++        logging.info(
++            'Total JAX model %s on %s predict time (includes compilation time, see --benchmark): %.1fs',
++            model_name, fasta_name, t_diff)
++
++        if benchmark:
++          t_0 = time.time()
++          model_runner.predict(processed_feature_dict,
++                               random_seed=model_random_seed)
++          t_diff = time.time() - t_0
++          timings[f'predict_benchmark_{model_name}'] = t_diff
++          logging.info(
++              'Total JAX model %s on %s predict time (excludes compilation time): %.1fs',
++              model_name, fasta_name, t_diff)
++
++        plddt = prediction_result['plddt']
++        ranking_confidences[model_name] = prediction_result['ranking_confidence']
++
++        # Remove jax dependency from results.
++        np_prediction_result = _jnp_to_np(dict(prediction_result))
++
++        # Save the model outputs.
++        result_output_path = os.path.join(output_dir, f'result_{model_name}.pkl')
++        with open(result_output_path, 'wb') as f:
++          pickle.dump(np_prediction_result, f, protocol=4)
++
++        # Add the predicted LDDT in the b-factor column.
++        # Note that higher predicted LDDT value means higher model confidence.
++        plddt_b_factors = np.repeat(
++            plddt[:, None], residue_constants.atom_type_num, axis=-1)
++        unrelaxed_protein = protein.from_prediction(
++            features=processed_feature_dict,
++            result=prediction_result,
++            b_factors=plddt_b_factors,
++            remove_leading_feature_dimension=not model_runner.multimer_mode)
++
++        unrelaxed_proteins[model_name] = unrelaxed_protein
++        unrelaxed_pdbs[model_name] = protein.to_pdb(unrelaxed_protein)
++        unrelaxed_pdb_path = os.path.join(output_dir, f'unrelaxed_{model_name}.pdb')
++        with open(unrelaxed_pdb_path, 'w') as f:
++          f.write(unrelaxed_pdbs[model_name])
++
++      # Rank by model confidence.
++      ranked_order = [
++          model_name for model_name, confidence in
++          sorted(ranking_confidences.items(), key=lambda x: x[1], reverse=True)]
++
++      # Relax predictions.
++      if models_to_relax == ModelsToRelax.BEST:
++        to_relax = [ranked_order[0]]
++      elif models_to_relax == ModelsToRelax.ALL:
++        to_relax = ranked_order
++      elif models_to_relax == ModelsToRelax.NONE:
++        to_relax = []
++
++      for model_name in to_relax:
++        t_0 = time.time()
++        relaxed_pdb_str, _, violations = amber_relaxer.process(
++            prot=unrelaxed_proteins[model_name])
++        relax_metrics[model_name] = {
++            'remaining_violations': violations,
++            'remaining_violations_count': sum(violations)
++        }
++        timings[f'relax_{model_name}'] = time.time() - t_0
++
++        relaxed_pdbs[model_name] = relaxed_pdb_str
++
++        # Save the relaxed PDB.
++        relaxed_output_path = os.path.join(
++            output_dir, f'relaxed_{model_name}.pdb')
++        with open(relaxed_output_path, 'w') as f:
++          f.write(relaxed_pdb_str)
++
++      # Write out relaxed PDBs in rank order.
++      for idx, model_name in enumerate(ranked_order):
++        ranked_output_path = os.path.join(output_dir, f'ranked_{idx}.pdb')
++        with open(ranked_output_path, 'w') as f:
++          if model_name in relaxed_pdbs:
++            f.write(relaxed_pdbs[model_name])
++          else:
++            f.write(unrelaxed_pdbs[model_name])
++
++      ranking_output_path = os.path.join(output_dir, 'ranking_debug.json')
++      with open(ranking_output_path, 'w') as f:
++        label = 'iptm+ptm' if 'iptm' in prediction_result else 'plddts'
++        f.write(json.dumps(
++            {label: ranking_confidences, 'order': ranked_order}, indent=4))
++
++      if models_to_relax != ModelsToRelax.NONE:
++        relax_metrics_path = os.path.join(output_dir, 'relax_metrics.json')
++        with open(relax_metrics_path, 'w') as f:
++          f.write(json.dumps(relax_metrics, indent=4))
+ 
+   logging.info('Final timings for %s: %s', fasta_name, timings)
+ 
+   timings_output_path = os.path.join(output_dir, 'timings.json')
+   with open(timings_output_path, 'w') as f:
+     f.write(json.dumps(timings, indent=4))
+-  if models_to_relax != ModelsToRelax.NONE:
+-    relax_metrics_path = os.path.join(output_dir, 'relax_metrics.json')
+-    with open(relax_metrics_path, 'w') as f:
+-      f.write(json.dumps(relax_metrics, indent=4))
+ 
+ 
+ def main(argv):
+   if len(argv) > 1:
+     raise app.UsageError('Too many command-line arguments.')
+ 
++  if FLAGS.only_msas and FLAGS.use_precomputed_msas:
++    raise app.UsageError('only_msas and use_precomputed_msas are incompatible')
++
+   for tool_name in (
+       'jackhmmer', 'hhblits', 'hhsearch', 'hmmsearch', 'hmmbuild', 'kalign'):
+     if not FLAGS[f'{tool_name}_binary_path'].value:
+@@ -415,6 +434,13 @@ def main(argv):
+       model_config.model.num_ensemble_eval = num_ensemble
+     else:
+       model_config.data.eval.num_ensemble = num_ensemble
++    if FLAGS.alphafold_config_yaml is not None:
++      if not os.path.isfile(FLAGS.alphafold_config_yaml):
++        raise ValueError('You provided an invalid path to a YAML file.')
++      with open(FLAGS.alphafold_config_yaml, 'r') as conf_from_yaml:
++        loaded_config = yaml.safe_load(conf_from_yaml)
++      model_config.update(loaded_config)
++      print('You are running with the following model config: {0}'.format(model_config))
+     model_params = data.get_model_haiku_params(
+         model_name=model_name, data_dir=FLAGS.data_dir)
+     model_runner = model.RunModel(model_config, model_params)
+@@ -449,7 +475,8 @@ def main(argv):
+         amber_relaxer=amber_relaxer,
+         benchmark=FLAGS.benchmark,
+         random_seed=random_seed,
+-        models_to_relax=FLAGS.models_to_relax)
++        models_to_relax=FLAGS.models_to_relax,
++        only_msas=FLAGS.only_msas)
+ 
+ 
+ if __name__ == '__main__':
