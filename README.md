@@ -33,6 +33,10 @@ module use modules/
 module load alphafold/2.3.2-with-msas-only-and-config-yaml
 ```
 
+This will add two "helper functions" to your environemnt
+* `alphafold-multimer`
+* `alphafold-monomer`
+
 For more details on how to use these helper function to run AlphaFold please see the example submission scripts and documentation below.
 
 # Example Slurm Submission Scripts
