@@ -17,11 +17,15 @@ singularity pull docker://mnballer1992/alphafold:2.3.2-quest
 # Create a module to wrap call to the container
 
 ### Create a local folder that can be used to hold the module file
+```
 mkdir -p modules/alphafold/
+```
 
 ### Navigate to the folder and download the module file
+```
 cd modules/alphafold
 wget https://raw.githubusercontent.com/nuitrcs/quest-alphafold-2.3.2-diff/main/2.3.2-with-msas-only-and-config-yaml.lua
+```
 
 ### You must edit the following parts of the modules file
 * The line `setenv("ALPHAFOLD_DATA_PATH", "/software/AlphaFold/data/v2.3.2/")` must be change to the location of the AlphaFold 2.3.2 databases on your system.
