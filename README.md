@@ -25,7 +25,7 @@ wget https://raw.githubusercontent.com/nuitrcs/quest-alphafold-2.3.2-diff/main/2
 
 ### You must edit the following parts of the modules file
 * The line `setenv("ALPHAFOLD_DATA_PATH", "/software/AlphaFold/data/v2.3.2/")` must be change to the location of the AlphaFold 2.3.2 databases on your system.
-* Your need to change every instance of `/software/AlphaFold/container/2.3.2/alphafold-2.3.2-with-msas-only-and-config-yaml.sif` to the absolutely path to the singularity image file on your system. The `sif` will exist on your system wherever your ran the `singularity pull` command from above.
+* Your need to change every instance of `/software/AlphaFold/container/2.3.2/alphafold-2.3.2-with-msas-only-and-config-yaml.sif` to the absolute path to the singularity image file on your system. The `sif` will exist on your system wherever your ran the `singularity pull` command from above.
 
 ### Now you can use the module in your submission scripts by doing the following
 ```
